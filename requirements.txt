@@ -1,0 +1,43 @@
+# ===== 基础科学计算 =====
+numpy>=1.26
+scipy>=1.11
+pandas>=2.1
+
+# ===== 深度学习 =====
+torch>=2.2
+torchvision>=0.17
+torchaudio>=2.2
+
+# ===== 计算机视觉 =====
+opencv-python>=4.9
+Pillow>=10.0
+
+# ===== 数据增强 =====
+albumentations>=1.4
+
+# ===== 模型结构（GhostNet等可能用到）=====
+timm>=0.9.12
+
+# ===== 可视化 =====
+matplotlib>=3.8
+seaborn>=0.13
+tensorboard>=2.15
+
+# ===== 进度条 =====
+tqdm>=4.66
+
+# ===== 配置管理（可选但推荐）=====
+pyyaml>=6.0
+
+# ===== 评估指标 =====
+scikit-learn>=1.3
+
+# ===== 文件处理 =====
+h5py>=3.10
+
+# ===== Jupyter（可选）=====
+notebook
+ipykernel
+
+# ===== 其他工具 =====
+einops>=0.7
