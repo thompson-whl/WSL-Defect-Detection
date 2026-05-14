@@ -3,7 +3,13 @@ import torch
 
 class Config:
     data_roots = ["./KolektorSDD", "./KolektorSDD2", "./mvtecad"]  # 支持多个数据集路径
-    data_root = data_roots[1]  # 默认使用第一个数据集路径
+    data_root = data_roots[2]  
+
+    # MVTecAD配置
+    mvtecad_category_list = ["bottle", "cable", "capsule", "carpet", "grid", 
+    "hazelnut", "leather", "metal_nut", "pill", "screw", "tile", "toothbrush", 
+    "transistor", "wood", "zipper"]
+    mvtecad_category = mvtecad_category_list[0]  # 可选: bottle, cable, capsule, carpet, grid, hazelnut, leather, metal_nut, pill, screw, tile, toothbrush, transistor, wood, zipper
 
     # 输出目录
     output_dir = "./outputs"
@@ -11,16 +17,18 @@ class Config:
     mask_dir = "./outputs/mask"
     model_path = "./outputs/model.pth"
 
-    img_size = 256
-    batch_size = 8
-    epochs = 1
+
+    # KolektorSDD/KolektorSDD2：256x512，MVTecAD：256x256
+    img_width = 256
+    img_height = 512
+    batch_size = 32
+    epochs = 50
     lr = 1e-3
     weight_decay = 1e-4
 
     # 损失函数权重
-    bce_weight=1.0
-    focal_weight=1.0
-    hs_weight=0.1
+    focal_weight=2.0
+    hs_weight=0.01
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
