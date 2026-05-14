@@ -7,9 +7,10 @@ from sklearn.metrics import precision_recall_curve, average_precision_score, f1_
 from tqdm import tqdm
 
 from models.wsl_net import WSLNet
-from utils.cam import GradCAMPlusPlus
+from torchcam.methods import GradCAMpp
 from config import Config
 from datasets.kolektor import KolektorDataset
+from datasets.mvtecad import MVTecADDataset
 
 
 def post_process_mask(mask, kernel_size=5):
@@ -31,13 +32,14 @@ def apply_intelligent_threshold(heatmap_uint8):
     """
     if heatmap_uint8.max() == 0:
         return np.zeros_like(heatmap_uint8)
-    
-    _, mask_otsu = cv2.threshold(heatmap_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    white_ratio = mask_otsu.sum() / (256 * 256 * 255)
-    
+
+    blurred = cv2.GaussianBlur(heatmap_uint8, (7, 7), 0)
+    _, mask_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    white_ratio = mask_otsu.sum() / (mask_otsu.size * 255.0)
+
     if white_ratio > 0.5 or white_ratio < 0.01:
         mask = cv2.adaptiveThreshold(
-            heatmap_uint8, 255,
+            blurred, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
             blockSize=11,
@@ -45,7 +47,7 @@ def apply_intelligent_threshold(heatmap_uint8):
         )
     else:
         mask = mask_otsu
-    
+
     return mask
 
 
@@ -71,25 +73,45 @@ def compute_pixel_metrics(pred_mask, gt_mask):
     fp = np.logical_and(pred_binary == 1, gt_binary == 0).sum()
     fn = np.logical_and(pred_binary == 0, gt_binary == 1).sum()
     tn = np.logical_and(pred_binary == 0, gt_binary == 0).sum()
-    
-    precision = tp / (tp + fp + 1e-8)
-    recall = tp / (tp + fn + 1e-8)
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+    if gt_binary.sum() == 0:
+        if pred_binary.sum() == 0:
+            precision = 1.0
+            recall = 1.0
+            f1 = 1.0
+        else:
+            precision = tp / (tp + fp + 1e-8)
+            recall = 1.0
+            f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    else:
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
     
     return precision, recall, f1, tp, fp, fn, tn
 
 
-def test_comprehensive(dataset_root="./KolektorSDD2", split="test"):
+def test_comprehensive(dataset_root=None, split="test", dataset_type="auto"):
     """
     综合测试：计算 AP, mIoU, Precision, Recall, F1-score
     并生成 P-R 曲线
     """
     device = Config.device
     
+    if dataset_root is None:
+        dataset_root = Config.data_root
+    
     # 加载数据集
     print(f"Loading {split} dataset from {dataset_root}...")
-    dataset = KolektorDataset(dataset_root, img_size=Config.img_size, train=(split=="train"), 
-                             dataset_type="kolektor_sdd2")
+    
+    if dataset_type == "auto":
+        if "mvtecad" in dataset_root.lower():
+            dataset_type = "mvtecad"
+    
+    if dataset_type == "mvtecad":
+        dataset = MVTecADDataset(dataset_root, Config.mvtecad_category, img_width=Config.img_width, img_height=Config.img_height, train=(split=="train"))
+    else:
+        dataset = KolektorDataset(dataset_root, img_width=Config.img_width, img_height=Config.img_height, train=(split=="train"), dataset_type=dataset_type)
     
     # 加载模型
     print("Loading model...")
@@ -97,11 +119,9 @@ def test_comprehensive(dataset_root="./KolektorSDD2", split="test"):
     model.load_state_dict(torch.load(Config.model_path))
     model.eval()
     
-    cam = GradCAMPlusPlus(model)
+    cam = GradCAMpp(model, target_layer=model.backbone[7])
     
-    # 创建输出目录
-    os.makedirs(Config.cam_dir, exist_ok=True)
-    os.makedirs(Config.mask_dir, exist_ok=True)
+    # 创建结果输出目录
     results_dir = os.path.join(Config.output_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
     
@@ -115,35 +135,34 @@ def test_comprehensive(dataset_root="./KolektorSDD2", split="test"):
         "f1": [],
         "iou": []
     }
+    anomaly_metrics = {
+        "precision": [],
+        "recall": [],
+        "f1": [],
+        "iou": []
+    }
     
     print(f"\nTesting on {len(dataset)} images...")
+    original_width = Config.img_width
+    original_height = Config.img_height
     
     # 测试循环
     for idx in tqdm(range(len(dataset))):
-        img_path = dataset.imgs[idx]
-        label = dataset.labels[idx]
-        label_map_path = dataset.label_maps[idx]
+        img, label, gt_mask = dataset[idx]
         
-        # 读取图像
-        img = cv2.imread(img_path)
-        original_height, original_width = img.shape[:2]
-        img_resized = cv2.resize(img, (256, 256))
-        img_rgb = img_resized[:, :, ::-1] / 255.0
+        gt_mask = gt_mask.numpy()  # Convert to numpy for cv2 operations
         
-        img_tensor = np.transpose(img_rgb, (2, 0, 1))
-        img_tensor = torch.tensor(img_tensor).unsqueeze(0).float().to(device)
+        img_tensor = img.unsqueeze(0).to(device)
         
-        # 获取 CAM
-        with torch.no_grad():
-            logits, _, _ = model(img_tensor)
-            logits_np = logits.squeeze().cpu().numpy()
+        # 获取 logits 和 probs
+        logits, _, _ = model(img_tensor)
+        probs = torch.sigmoid(logits).squeeze().detach().cpu().numpy()
         
-        all_scores.append(logits_np)
-        all_labels.append(label)
+        all_scores.append(float(probs))
+        all_labels.append(label.item() if isinstance(label, torch.Tensor) else float(label))
         
         # 生成 CAM 热力图
-        heatmap = cam(img_tensor)
-        heatmap = heatmap.squeeze().detach().cpu().numpy()
+        heatmap = cam(class_idx=0, scores=logits)[0].squeeze().detach().cpu().numpy()
         
         # 归一化
         if heatmap.max() > heatmap.min():
@@ -165,29 +184,20 @@ def test_comprehensive(dataset_root="./KolektorSDD2", split="test"):
         mask_resized = cv2.resize(mask, (original_width, original_height), 
                                    interpolation=cv2.INTER_NEAREST)
         
-        # 读取真实标签
-        gt_label = cv2.imread(label_map_path, cv2.IMREAD_GRAYSCALE)
-        if gt_label is None:
-            continue
-        gt_label_resized = cv2.resize(gt_label, (original_width, original_height),
-                                      interpolation=cv2.INTER_NEAREST)
-        
         # 计算像素级别指标
-        precision, recall, f1, tp, fp, fn, tn = compute_pixel_metrics(mask_resized, gt_label_resized)
-        iou = compute_iou(mask_resized, gt_label_resized)
+        precision, recall, f1, tp, fp, fn, tn = compute_pixel_metrics(mask_resized, gt_mask)
+        iou = compute_iou(mask_resized, gt_mask)
         
         image_metrics["precision"].append(precision)
         image_metrics["recall"].append(recall)
         image_metrics["f1"].append(f1)
         image_metrics["iou"].append(iou)
         
-        # 保存结果
-        img_name = os.path.basename(img_path)
-        cam_path = os.path.join(Config.cam_dir, img_name)
-        cv2.imwrite(cam_path, heatmap_resized)
-        
-        mask_path = os.path.join(Config.mask_dir, img_name)
-        cv2.imwrite(mask_path, mask_resized)
+        if gt_mask.sum() > 0:
+            anomaly_metrics["precision"].append(precision)
+            anomaly_metrics["recall"].append(recall)
+            anomaly_metrics["f1"].append(f1)
+            anomaly_metrics["iou"].append(iou)
     
     # 计算图像级别指标
     all_scores = np.array(all_scores)
@@ -196,8 +206,19 @@ def test_comprehensive(dataset_root="./KolektorSDD2", split="test"):
     # AP (Average Precision)
     ap = average_precision_score(all_labels, all_scores)
     
-    # 图像级别分类指标
-    binary_preds = (all_scores > 0.5).astype(int)
+    # 先使用标准 0.5 阈值，再根据必要时使用最佳 F1 阈值
+    binary_preds = (all_scores >= 0.5).astype(int)
+    if binary_preds.sum() == 0 and len(np.unique(all_labels)) > 1:
+        # 如果所有预测都被判为正常，则从 Precision-Recall 曲线选择最佳阈值
+        precision_curve_vals, recall_curve_vals, thresholds = precision_recall_curve(all_labels, all_scores)
+        f1_curve = 2 * precision_curve_vals * recall_curve_vals / (precision_curve_vals + recall_curve_vals + 1e-8)
+        best_idx = np.nanargmax(f1_curve)
+        if best_idx < len(thresholds):
+            best_threshold = thresholds[best_idx]
+            binary_preds = (all_scores >= best_threshold).astype(int)
+        else:
+            binary_preds = (all_scores >= 0.5).astype(int)
+
     img_precision = precision_score(all_labels, binary_preds, zero_division=0)
     img_recall = recall_score(all_labels, binary_preds, zero_division=0)
     img_f1 = f1_score(all_labels, binary_preds, zero_division=0)
@@ -207,6 +228,10 @@ def test_comprehensive(dataset_root="./KolektorSDD2", split="test"):
     mean_recall = np.mean(image_metrics["recall"])
     mean_f1 = np.mean(image_metrics["f1"])
     mean_iou = np.mean(image_metrics["iou"])
+    anomaly_mean_precision = np.mean(anomaly_metrics["precision"]) if len(anomaly_metrics["precision"]) > 0 else 0.0
+    anomaly_mean_recall = np.mean(anomaly_metrics["recall"]) if len(anomaly_metrics["recall"]) > 0 else 0.0
+    anomaly_mean_f1 = np.mean(anomaly_metrics["f1"]) if len(anomaly_metrics["f1"]) > 0 else 0.0
+    anomaly_mean_iou = np.mean(anomaly_metrics["iou"]) if len(anomaly_metrics["iou"]) > 0 else 0.0
     
     # 打印结果
     print("\n" + "="*70)
@@ -218,11 +243,17 @@ def test_comprehensive(dataset_root="./KolektorSDD2", split="test"):
     print(f"  Recall:                        {img_recall:.4f}")
     print(f"  F1-Score:                      {img_f1:.4f}")
     
-    print(f"\nPixel-level Segmentation Metrics (Mean):")
+    print(f"\nPixel-level Segmentation Metrics (Mean over all images):")
     print(f"  Precision:                     {mean_precision:.4f}")
     print(f"  Recall:                        {mean_recall:.4f}")
     print(f"  F1-Score:                      {mean_f1:.4f}")
     print(f"  mIoU (Mean IoU):               {mean_iou:.4f}")
+    
+    print(f"\nPixel-level Segmentation Metrics (Mean over anomaly images only):")
+    print(f"  Precision:                     {anomaly_mean_precision:.4f}")
+    print(f"  Recall:                        {anomaly_mean_recall:.4f}")
+    print(f"  F1-Score:                      {anomaly_mean_f1:.4f}")
+    print(f"  mIoU (Mean IoU):               {anomaly_mean_iou:.4f}")
     
     print("="*70 + "\n")
     
@@ -257,7 +288,7 @@ def test_comprehensive(dataset_root="./KolektorSDD2", split="test"):
     print(f"✓ P-R curve saved to {pr_curve_path}")
     
     # 保存指标到文件
-    metrics_path = os.path.join(results_dir, 'metrics.txt')
+    metrics_path = os.path.join(results_dir, 'test_results.txt')
     with open(metrics_path, 'w') as f:
         f.write("="*70 + "\n")
         f.write("EVALUATION RESULTS\n")
@@ -291,11 +322,14 @@ def test_comprehensive(dataset_root="./KolektorSDD2", split="test"):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Comprehensive evaluation on KolektorSDD2")
-    parser.add_argument("--dataset", type=str, default="./KolektorSDD2", 
-                       help="KolektorSDD2 root path")
+    parser = argparse.ArgumentParser(description="Comprehensive evaluation on defect detection datasets")
+    parser.add_argument("--dataset", type=str, default=None, 
+                       help="Dataset root path (defaults to Config.data_root)")
     parser.add_argument("--split", type=str, default="test", choices=["train", "test"],
                        help="Train or test split")
+    parser.add_argument("--dataset-type", type=str, default="auto", 
+                       choices=["auto", "kolektor_sdd", "kolektor_sdd2", "mvtecad"],
+                       help="Dataset type")
     args = parser.parse_args()
     
-    results = test_comprehensive(dataset_root=args.dataset, split=args.split)
+    results = test_comprehensive(dataset_root=args.dataset, split=args.split, dataset_type=args.dataset_type)
