@@ -4,6 +4,7 @@ import os
 import matplotlib.pyplot as plt
 from config import Config
 from datasets.kolektor import KolektorDataset
+from datasets.mvtecad import MVTecADDataset
 from models.wsl_net import WSLNet
 from utils.losses import *
 import time
@@ -13,7 +14,7 @@ def plot_loss_curves(history):
     """
     Plot and save loss curves
     - Total loss
-    - Individual loss components (Weighted BCE, Focal, HS)
+    - Individual loss components (Focal, HS)
     - Learning rate changes
     """
     os.makedirs(Config.output_dir, exist_ok=True)
@@ -38,7 +39,6 @@ def plot_loss_curves(history):
         else:
             print(f"Warning: skipping {label} because x/y lengths differ ({len(x)} vs {len(y)})")
 
-    safe_plot(history['epoch'], history.get('weighted_bce_loss', []), 'r-', 'Weighted BCE Loss')
     safe_plot(history['epoch'], history.get('focal_loss', []), 'g-', 'Focal Loss')
     safe_plot(history['epoch'], history.get('hs_loss', []), 'orange', 'HS Loss')
     ax2.set_xlabel('Epoch', fontsize=11)
@@ -91,18 +91,18 @@ def train(dataset_root=None, dataset_type="auto"):
     if dataset_root is None:
         dataset_root = Config.data_root
     
-    dataset = KolektorDataset(dataset_root, img_size=Config.img_size, train=True, dataset_type=dataset_type)
-    # 优化：增加num_workers到4-8，增加batch_size，启用更好的prefetch
-    loader = DataLoader(
-        dataset, 
-        batch_size=Config.batch_size, 
-        shuffle=True, 
-        num_workers=8,  # 增加从2到8
-        pin_memory=True, 
-        prefetch_factor=4,  # 增加从2到4
-        persistent_workers=True  # 保持worker进程活跃
-    )
-
+    # Auto-detect dataset type if set to "auto"
+    if dataset_type == "auto":
+        if "mvtecad" in dataset_root.lower():
+            dataset_type = "mvtecad"
+        else:
+            dataset_type = "auto"  # Keep as auto for KolektorDataset to handle
+    
+    if dataset_type == "mvtecad":
+        dataset = MVTecADDataset(dataset_root, Config.mvtecad_category, img_width=Config.img_width, img_height=Config.img_height, train=True)
+    else:
+        dataset = KolektorDataset(dataset_root, img_width=Config.img_width, img_height=Config.img_height, train=True, dataset_type=dataset_type)
+    
     model = WSLNet().to(device)
 
     # 使用AdamW优化器，weight_decay有助于正则化
@@ -111,14 +111,12 @@ def train(dataset_root=None, dataset_type="auto"):
     # 学习率调度器：余弦退火
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.epochs, eta_min=Config.lr * 0.01)
 
-    bce = torch.nn.BCEWithLogitsLoss()
     focal = FocalLoss()
 
     # Initialize loss history
     history = {
         'epoch': [],
         'total_loss': [],
-        'weighted_bce_loss': [],
         'focal_loss': [],
         'hs_loss': [],
         'lr': [],
@@ -154,25 +152,60 @@ def train(dataset_root=None, dataset_type="auto"):
         f.write(f"{'='*70}\n\n")
 
     for epoch in range(Config.epochs):
+        # Curriculum learning: gradually increase anomaly sampling weight
+        curriculum_factor = epoch / max(1, Config.epochs - 1)  # 0 to 1
+        boost_factor = 2.0  # anomaly weight can increase up to 3x
+        
+        # Update sample weights for curriculum learning (only for Kolektor datasets)
+        if hasattr(dataset, '_compute_sample_weights'):
+            dataset.sample_weights = dataset._compute_sample_weights(curriculum_factor, boost_factor)
+        
+        # Recreate DataLoader with updated weights
+        if hasattr(dataset, 'sample_weights') and dataset.sample_weights is not None:
+            from torch.utils.data import WeightedRandomSampler
+            sampler = WeightedRandomSampler(weights=dataset.sample_weights, num_samples=len(dataset), replacement=True)
+            loader = DataLoader(
+                dataset, 
+                batch_size=Config.batch_size, 
+                sampler=sampler,
+                num_workers=8,
+                pin_memory=True, 
+                prefetch_factor=4,
+                persistent_workers=True
+            )
+        else:
+            loader = DataLoader(
+                dataset, 
+                batch_size=Config.batch_size, 
+                shuffle=True, 
+                num_workers=8,
+                pin_memory=True, 
+                prefetch_factor=4,
+                persistent_workers=True
+            )
+
         model.train()
         total_loss = 0
-        total_bce_loss = 0
         total_focal_loss = 0
         total_hs_loss = 0
         epoch_start = time.time()
 
-        for img, label in loader:
+        for batch in loader:
+            if len(batch) == 3:
+                img, label, _ = batch
+            else:
+                img, label = batch
+
             img = img.to(device)
             label = label.unsqueeze(1).to(device)
 
             logits, feat_vec, _ = model(img)
 
             # 多任务损失
-            loss_bce = Config.bce_weight * bce(logits, label)
             loss_focal = Config.focal_weight * focal(logits, label)
             loss_hs = Config.hs_weight * hypersphere_loss(feat_vec, label.squeeze(), model.center)
 
-            loss = loss_bce + loss_focal + loss_hs
+            loss = loss_focal + loss_hs
 
             optimizer.zero_grad()
             loss.backward()
@@ -183,18 +216,16 @@ def train(dataset_root=None, dataset_type="auto"):
             optimizer.step()
 
             total_loss += loss.item()
-            total_bce_loss += loss_bce.item()
             total_focal_loss += loss_focal.item()
             total_hs_loss += loss_hs.item()
 
         avg_loss = total_loss / len(loader)
-        avg_bce = total_bce_loss / len(loader)
         avg_focal = total_focal_loss / len(loader)
         avg_hs = total_hs_loss / len(loader)
         epoch_time = time.time() - epoch_start
         current_lr = optimizer.param_groups[0]['lr']
         
-        log_msg = f"Epoch {epoch+1:3d}/{Config.epochs}: Loss={avg_loss:.4f} (BCE={avg_bce:.4f}, Focal={avg_focal:.4f}, HS={avg_hs:.4f}), LR={current_lr:.6f}, Time={epoch_time:.1f}s"
+        log_msg = f"Epoch {epoch+1:3d}/{Config.epochs}: Loss={avg_loss:.4f} (Focal={avg_focal:.4f}, HS={avg_hs:.4f}), LR={current_lr:.6f}, Time={epoch_time:.1f}s"
         print(log_msg)
         
         # 写入日志文件
@@ -203,7 +234,6 @@ def train(dataset_root=None, dataset_type="auto"):
 
         history['epoch'].append(epoch + 1)
         history['total_loss'].append(avg_loss)
-        history['weighted_bce_loss'].append(avg_bce)
         history['focal_loss'].append(avg_focal)
         history['hs_loss'].append(avg_hs)
         history['lr'].append(current_lr)
@@ -246,7 +276,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Train WSL model on defect detection dataset")
     parser.add_argument("--dataset", type=str, default=None, help="Dataset root path (default: Config.data_root)")
-    parser.add_argument("--dataset-type", type=str, default="auto", choices=["auto", "kolektor_sdd", "kolektor_sdd2"],
+    parser.add_argument("--dataset-type", type=str, default="auto", choices=["auto", "kolektor_sdd", "kolektor_sdd2", "mvtecad"],
                         help="Dataset type (default: auto-detect)")
     args = parser.parse_args()
     
