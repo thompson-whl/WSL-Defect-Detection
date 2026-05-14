@@ -4,8 +4,8 @@ import cv2
 import numpy as np
 
 from models.wsl_net import WSLNet
-from utils.cam import GradCAMPlusPlus
 from config import Config
+from torchcam.methods import GradCAMpp
 
 def post_process_mask(mask, kernel_size=5):
     """
@@ -71,22 +71,22 @@ def test(img_path):
     model.load_state_dict(torch.load(Config.model_path))
     model.eval()
 
-    cam = GradCAMPlusPlus(model)
+    cam = GradCAMpp(model, target_layer=model.backbone[9])  # 使用 backbone 的最后一个卷积层作为 CAM 的目标层
 
     # ===== 读取图像 =====
     img_name = os.path.basename(img_path)
 
     img = cv2.imread(img_path)
     original_height, original_width = img.shape[:2]  # 保存原始尺寸
-    img = cv2.resize(img, (256, 256))
+    img = cv2.resize(img, (Config.img_width, Config.img_height))
     img_rgb = img[:, :, ::-1] / 255.0
 
     img_tensor = np.transpose(img_rgb, (2, 0, 1))
     img_tensor = torch.tensor(img_tensor).unsqueeze(0).float().to(device)
 
     # ===== CAM =====
-    heatmap = cam(img_tensor)  # 返回 [B, 1, H, W]
-    heatmap = heatmap.squeeze().detach().cpu().numpy()  # [H, W]
+    logits, _, _ = model(img_tensor)
+    heatmap = cam(class_idx=0, scores=logits)[0].squeeze().detach().cpu().numpy()
 
     # ===== 数值统计调试信息 =====
     print(f"\n{'='*60}")
@@ -134,6 +134,6 @@ def test(img_path):
 
 
 if __name__ == "__main__":
-    test("test.jpg")
-    test("test1.jpg")
-    test("test2.jpg")
+    test("test.png")
+    #test("test.jpg")
+    # test("test2.jpg")
